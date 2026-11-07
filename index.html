@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"><title>MyChat</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{margin:0;font-family:sans-serif;background:#313338;color:#dbdee1;height:100vh;display:flex}
+  #login{margin:auto;background:#2b2d31;padding:30px;border-radius:8px;display:flex;flex-direction:column;gap:10px}
+  input,button{padding:10px;border-radius:4px;border:none;font-size:15px}
+  input{background:#1e1f22;color:#fff}
+  button{background:#5865f2;color:#fff;cursor:pointer}
+  button.red{background:#da373c}
+  #app{display:none;flex:1}
+  #side{width:220px;background:#2b2d31;padding:12px;display:flex;flex-direction:column;gap:8px}
+  #main{flex:1;display:flex;flex-direction:column}
+  #msgs{flex:1;overflow-y:auto;padding:16px}
+  .m{margin:6px 0}.m b{color:#fff}.m small{color:#949ba4;margin-left:6px}
+  .sys{color:#949ba4;font-style:italic;font-size:13px}
+  #form{display:flex;padding:12px;gap:8px}#form input{flex:1}
+  .u{padding:4px}.u.v::after{content:" 🔊"}
+</style>
+</head>
+<body>
+<div id="login">
+  <h2>MyChat</h2>
+  <input id="name" placeholder="Ник">
+  <input id="room" placeholder="Комната" value="general">
+  <button onclick="join()">Войти</button>
+</div>
+
+<div id="app">
+  <div id="side">
+    <b id="roomTitle"></b>
+    <button id="voiceBtn" onclick="toggleVoice()">🎤 Войти в голос</button>
+    <button id="muteBtn" onclick="toggleMute()" style="display:none">Выкл. микрофон</button>
+    <hr style="width:100%;border-color:#444"><b>Участники</b>
+    <div id="users"></div>
+  </div>
+  <div id="main">
+    <div id="msgs"></div>
+    <form id="form" onsubmit="sendChat(event)">
+      <input id="text" placeholder="Сообщение..." autocomplete="off">
+      <button>➤</button>
+    </form>
+  </div>
+</div>
+
+<script>
+let ws, myId, stream = null, peers = {}, muted = false;
+const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+const $ = id => document.getElementById(id);
+const send = m => ws.send(JSON.stringify(m));
+
+function join() {
+  const name = $('name').value.trim(), room = $('room').value.trim() || 'general';
+  if (!name) return alert('Введите ник');
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+  ws.onopen = () => send({ type: 'join', name, room });
+  ws.onmessage = e => handle(JSON.parse(e.data));
+  ws.onclose = () => addSys('Соединение потеряно');
+  $('login').style.display = 'none'; $('app').style.display = 'flex';
+  $('roomTitle').textContent = '# ' + room;
+}
+
+function handle(m) {
+  if (m.type === 'welcome') { myId = m.id; m.history.forEach(addMsg); }
+  else if (m.type === 'chat') addMsg(m);
+  else if (m.type === 'system') addSys(m.text);
+  else if (m.type === 'users') updateUsers(m.users);
+  else if (m.type === 'signal') onSignal(m.from, m.data);
+}
+
+function addMsg(m) {
+  const d = document.createElement('div'); d.className = 'm';
+  const b = document.createElement('b'); b.textContent = m.name;
+  const s = document.createElement('small'); s.textContent = new Date(m.ts).toLocaleTimeString();
+  const t = document.createElement('div'); t.textContent = m.text;
+  d.append(b, s, t); $('msgs').append(d); $('msgs').scrollTop = 1e9;
+}
+function addSys(text) {
+  const d = document.createElement('div'); d.className = 'sys'; d.textContent = text;
+  $('msgs').append(d); $('msgs').scrollTop = 1e9;
+}
+function sendChat(e) {
+  e.preventDefault();
+  const t = $('text').value.trim(); if (!t) return;
+  send({ type: 'chat', text: t }); $('text').value = '';
+}
+
+function updateUsers(list) {
+  $('users').innerHTML = '';
+  list.forEach(u => {
+    const d = document.createElement('div'); d.className = 'u' + (u.voice ? ' v' : '');
+    d.textContent = u.name + (u.id === myId ? ' (вы)' : ''); $('users').append(d);
+  });
+  if (!stream) return;
+  const voiceIds = list.filter(u => u.voice && u.id !== myId).map(u => u.id);
+  for (const id in peers) if (!voiceIds.includes(+id)) closePeer(id);
+  // инициатор соединения — участник с большим id (чтобы не было двойных звонков)
+  voiceIds.forEach(async id => {
+    if (!peers[id] && myId > id) {
+      const pc = peer(id);
+      await pc.setLocalDescription(await pc.createOffer());
+      send({ type: 'signal', to: id, data: { sdp: pc.localDescription } });
+    }
+  });
+}
+
+function peer(id) {
+  if (peers[id]) return peers[id];
+  const pc = new RTCPeerConnection(ICE); pc._q = [];
+  stream.getTracks().forEach(t => pc.addTrack(t, stream));
+  pc.onicecandidate = e => e.candidate && send({ type: 'signal', to: id, data: { candidate: e.candidate } });
+  pc.ontrack = e => {
+    let a = $('a' + id);
+    if (!a) { a = document.createElement('audio'); a.id = 'a' + id; a.autoplay = true; document.body.append(a); }
+    a.srcObject = e.streams[0];
+  };
+  return peers[id] = pc;
+}
+function closePeer(id) { peers[id].close(); delete peers[id]; $('a' + id)?.remove(); }
+
+async function onSignal(from, d) {
+  if (!stream) return;
+  const pc = peer(from);
+  if (d.sdp) {
+    await pc.setRemoteDescription(d.sdp);
+    for (const c of pc._q) await pc.addIceCandidate(c).catch(() => {});
+    pc._q = [];
+    if (d.sdp.type === 'offer') {
+      await pc.setLocalDescription(await pc.createAnswer());
+      send({ type: 'signal', to: from, data: { sdp: pc.localDescription } });
+    }
+  } else if (d.candidate) {
+    if (pc.remoteDescription) pc.addIceCandidate(d.candidate).catch(() => {});
+    else pc._q.push(d.candidate);
+  }
+}
+
+async function toggleVoice() {
+  if (!stream) {
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }); }
+    catch (e) { return alert('Нет доступа к микрофону. Нужен localhost или HTTPS.\n' + e); }
+    send({ type: 'voice', on: true });
+    $('voiceBtn').textContent = '📴 Выйти из голоса'; $('voiceBtn').className = 'red';
+    $('muteBtn').style.display = '';
+  } else {
+    Object.keys(peers).forEach(closePeer);
+    stream.getTracks().forEach(t => t.stop()); stream = null; muted = false;
+    send({ type: 'voice', on: false });
+    $('voiceBtn').textContent = '🎤 Войти в голос'; $('voiceBtn').className = '';
+    $('muteBtn').style.display = 'none'; $('muteBtn').textContent = 'Выкл. микрофон';
+  }
+}
+function toggleMute() {
+  muted = !muted;
+  stream.getAudioTracks().forEach(t => t.enabled = !muted);
+  $('muteBtn').textContent = muted ? 'Вкл. микрофон' : 'Выкл. микрофон';
+}
+</script>
+</body>
+</html>
